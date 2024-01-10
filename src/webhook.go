@@ -5,15 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/ghodss/yaml"
 	"github.com/golang/glog"
 	"io/ioutil"
 	"k8s.io/api/admission/v1beta1"
+	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"log"
 	"net/http"
@@ -34,9 +35,7 @@ var (
 )
 
 var (
-	config, err1    = rest.InClusterConfig()
-	clientset, err2 = kubernetes.NewForConfig(config)
-	api             = clientset.CoreV1()
+	config, err1 = rest.InClusterConfig()
 )
 
 var ignoredNamespaces = []string{
@@ -158,7 +157,7 @@ func updateAnnotation(target map[string]string, added map[string]string) (patch 
 }
 
 // create mutation patch for resoures
-//func createPatch(pod *corev1.Pod, sidecarConfig *Config, annotations map[string]string) ([]byte, error) {
+// func createPatch(pod *corev1.Pod, sidecarConfig *Config, annotations map[string]string) ([]byte, error) {
 func createPatch(pod *corev1.Pod, nodeselectors map[string]string) ([]byte, error) {
 	var patch []patchOperation
 
@@ -191,9 +190,8 @@ func (whsvr *WebhookServer) mutate(ar *v1beta1.AdmissionReview, serviceInstanceN
 			Allowed: true,
 		}
 	}
-
 	// Workaround: https://github.com/kubernetes/kubernetes/issues/57982
-	nodeselectors, ok := GetNodeLabel(req.Namespace, pod.GenerateName, pod.Labels["pod-template-hash"], serviceInstanceNum)
+	nodeselectors, ok := GetNodeLabel(req.Namespace, pod, serviceInstanceNum)
 	if !ok {
 		glog.Infof("serviceInstanceNum=%d Skipping mutation for %s/%s due to GetNodeLabel failure", serviceInstanceNum, pod.Namespace, pod.Name)
 		return &v1beta1.AdmissionResponse{
@@ -288,107 +286,38 @@ func (whsvr *WebhookServer) serve(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func GetNodeLabel(nameSpace string, podGenerateName string, podTemplateHash string, serviceInstanceNum int) (map[string]string, bool) {
-
+func GetNodeLabel(nameSpace string, pod corev1.Pod, serviceInstanceNum int) (map[string]string, bool) {
 	if err1 != nil {
 		panic(err1.Error())
 	}
 	if err2 != nil {
 		panic(err2.Error())
 	}
+	if err3 != nil {
+		panic(err3.Error())
+	}
 
 	result := false
 	nodeselectors := make(map[string]string)
 
 	if AppLogLevel == "INFO" {
-		glog.Infof("serviceInstanceNum=%d GetNodeLabel  nameSpace=%v podGenerateName=%v podTemplateHash=%v", serviceInstanceNum, nameSpace, podGenerateName, podTemplateHash)
+		glog.Infof("serviceInstanceNum=%d GetNodeLabel  nameSpace=%v pod.GenerateName=%v pod.Labels=%v", serviceInstanceNum, nameSpace, pod.GenerateName, pod.Labels)
 	}
 
-	podNameSplitList := strings.Split(podGenerateName, podTemplateHash)
+	podTemplateHash, isRollout := pod.Labels["rollouts-pod-template-hash"]
+	if !isRollout {
+		podTemplateHash, _ = pod.Labels["pod-template-hash"]
+	}
+	podNameSplitList := strings.Split(pod.GenerateName, podTemplateHash)
 	fmt.Println("")
-	deploymentName := strings.Trim(podNameSplitList[0], "-")
-
-	nodeselectors, result = ProcessDeployment(nameSpace, deploymentName, serviceInstanceNum, "CREATE")
-
+	targetName := strings.Trim(podNameSplitList[0], "-")
+	if isRollout {
+		nodeselectors, result = ProcessRollout(nameSpace, targetName, serviceInstanceNum, "CREATE")
+	} else {
+		nodeselectors, result = ProcessDeployment(nameSpace, targetName, serviceInstanceNum, "CREATE")
+	}
 	return nodeselectors, result
 
-}
-
-func ProcessDeployment(nameSpace string, deploymentName string, serviceInstanceNum int, flow string) (map[string]string, bool) {
-
-	var numOfReplicas int
-
-	result := true
-	nodeselectors := make(map[string]string)
-	deploymentAnnotations := map[string]string{}
-
-	deploymentsClient := clientset.AppsV1().Deployments(nameSpace)
-	deploymentData, getErr := deploymentsClient.Get(context.TODO(), deploymentName, metav1.GetOptions{})
-	if getErr != nil {
-		panic(fmt.Errorf("Failed to get latest version of Deployment: %v", getErr))
-	}
-
-	deploymentAnnotations = deploymentData.Annotations
-
-	if strategy, ok := deploymentAnnotations["custom-pod-schedule-strategy"]; ok && strategy != "" {
-
-		numOfReplicas = int(*deploymentData.Spec.Replicas)
-		if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
-			glog.Infof("flow=%s serviceInstanceNum=%d Found a deployment %s in namespace %s with total replicas %d and strategy=%s", flow, serviceInstanceNum, deploymentName, nameSpace, numOfReplicas, strategy)
-		}
-
-		if nodeLabelStrategyList, ok := GetPodsCustomSchedulingStrategyList(strategy, numOfReplicas, serviceInstanceNum); ok {
-			if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
-				glog.Infof("flow=%s serviceInstanceNum=%d nodeLabelStrategyList=%v", flow, serviceInstanceNum, nodeLabelStrategyList)
-			}
-
-			for _, nodeLabelStrategy := range nodeLabelStrategyList {
-				if AppLogLevel == "TRACE" {
-					glog.Infof("flow=%s serviceInstanceNum=%d nodeLabel=%s needs %d replicas\n", flow, serviceInstanceNum, nodeLabelStrategy.NodeLabel, nodeLabelStrategy.Replicas)
-				}
-				ExistingPodsList, result := GetNumOfExistingPods(nameSpace, deploymentName, nodeLabelStrategy.NodeLabel, serviceInstanceNum)
-				numOfExistingPods := len(ExistingPodsList)
-				if result {
-
-					if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
-						glog.Infof("flow=%s serviceInstanceNum=%d nodeLabel=%s currently runs %d pods", flow, serviceInstanceNum, nodeLabelStrategy.NodeLabel, numOfExistingPods)
-					}
-
-					if numOfExistingPods < nodeLabelStrategy.Replicas {
-						if flow == "CREATE" {
-							glog.Infof("flow=%s serviceInstanceNum=%d Currently running %d pods is less than expected %d, scheduling pod on nodeLabel %s", flow, serviceInstanceNum, numOfExistingPods, nodeLabelStrategy.Replicas, nodeLabelStrategy.NodeLabel)
-							nodeLabelSplit := strings.Split(nodeLabelStrategy.NodeLabel, "=")
-
-							nodeselectors[nodeLabelSplit[0]] = nodeLabelSplit[1]
-							return nodeselectors, result
-						}
-
-					} else if numOfExistingPods == nodeLabelStrategy.Replicas {
-
-						if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
-							glog.Infof("flow=%s serviceInstanceNum=%d Currently running %d pods is SAME as expected %d, ignoring the nodeLabel %s", flow, serviceInstanceNum, numOfExistingPods, nodeLabelStrategy.Replicas, nodeLabelStrategy.NodeLabel)
-						}
-
-					} else {
-						if flow == "DELETE" {
-							numOfPodsToBeDeleted := numOfExistingPods - nodeLabelStrategy.Replicas
-							glog.Infof("flow=%s serviceInstanceNum=%d Currently running %d pods is more than expected %d, So deleting %d pods on nodeLabel %s", flow, serviceInstanceNum, numOfExistingPods, nodeLabelStrategy.Replicas, numOfPodsToBeDeleted, nodeLabelStrategy.NodeLabel)
-							DeleteExtraPods(nameSpace, ExistingPodsList, numOfPodsToBeDeleted)
-						}
-					}
-
-				} else {
-					result = false
-					glog.Infof("flow=%s serviceInstanceNum=%d GetNumOfExistingPods failed. Ignoring Custom scheduling for nodeLabel=%s", flow, serviceInstanceNum, nodeLabelStrategy.NodeLabel)
-				}
-			}
-		} else {
-			result = false
-			glog.Infof("flow=%s serviceInstanceNum=%d Looks like Strategy declaration is wrong. Ignoring the custom scheduling. Pls fix and re-try", flow, serviceInstanceNum)
-		}
-	}
-
-	return nodeselectors, result
 }
 
 func GetPodsCustomSchedulingStrategyList(Strategy string, numOfReplicas int, serviceInstanceNum int) ([]NodeLabelStrategy, bool) {
@@ -605,8 +534,75 @@ func GetNumOfExistingPods(namespace string, deploymentName string, nodeLabel str
 	return ExistingPodsList, result
 }
 
-func DeleteExtraPods(nameSpace string, ExistingPodsList []string, numOfPodsToBeDeleted int) {
+func ProcessData[T *v1.Deployment | *v1alpha1.Rollout](strategy string, data T, targetName string, nameSpace string, serviceInstanceNum int, flow string) (map[string]string, bool) {
+	var numOfReplicas int
+	nodeselectors := make(map[string]string)
+	result := true
+	switch d := any(data).(type) {
+	case *v1.Deployment:
+		numOfReplicas = int(*d.Spec.Replicas)
+	case *v1alpha1.Rollout:
+		numOfReplicas = int(*d.Spec.Replicas)
+	default:
+		result = false
+		return nodeselectors, result
+	}
+	if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
+		glog.Infof("flow=%s serviceInstanceNum=%d Found a deployment %s in namespace %s with total replicas %d and strategy=%s", flow, serviceInstanceNum, targetName, nameSpace, numOfReplicas, strategy)
+	}
+	if nodeLabelStrategyList, ok := GetPodsCustomSchedulingStrategyList(strategy, numOfReplicas, serviceInstanceNum); ok {
+		if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
+			glog.Infof("flow=%s serviceInstanceNum=%d nodeLabelStrategyList=%v", flow, serviceInstanceNum, nodeLabelStrategyList)
+		}
 
+		for _, nodeLabelStrategy := range nodeLabelStrategyList {
+			if AppLogLevel == "TRACE" {
+				glog.Infof("flow=%s serviceInstanceNum=%d nodeLabel=%s needs %d replicas\n", flow, serviceInstanceNum, nodeLabelStrategy.NodeLabel, nodeLabelStrategy.Replicas)
+			}
+			ExistingPodsList, result := GetNumOfExistingPods(nameSpace, targetName, nodeLabelStrategy.NodeLabel, serviceInstanceNum)
+			numOfExistingPods := len(ExistingPodsList)
+			if result {
+
+				if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
+					glog.Infof("flow=%s serviceInstanceNum=%d nodeLabel=%s currently runs %d pods", flow, serviceInstanceNum, nodeLabelStrategy.NodeLabel, numOfExistingPods)
+				}
+
+				if numOfExistingPods < nodeLabelStrategy.Replicas {
+					if flow == "CREATE" {
+						glog.Infof("flow=%s serviceInstanceNum=%d Currently running %d pods is less than expected %d, scheduling pod on nodeLabel %s", flow, serviceInstanceNum, numOfExistingPods, nodeLabelStrategy.Replicas, nodeLabelStrategy.NodeLabel)
+						nodeLabelSplit := strings.Split(nodeLabelStrategy.NodeLabel, "=")
+
+						nodeselectors[nodeLabelSplit[0]] = nodeLabelSplit[1]
+						return nodeselectors, result
+					}
+
+				} else if numOfExistingPods == nodeLabelStrategy.Replicas {
+
+					if AppLogLevel == "INFO" || AppLogLevel == "TRACE" {
+						glog.Infof("flow=%s serviceInstanceNum=%d Currently running %d pods is SAME as expected %d, ignoring the nodeLabel %s", flow, serviceInstanceNum, numOfExistingPods, nodeLabelStrategy.Replicas, nodeLabelStrategy.NodeLabel)
+					}
+
+				} else {
+					if flow == "DELETE" {
+						numOfPodsToBeDeleted := numOfExistingPods - nodeLabelStrategy.Replicas
+						glog.Infof("flow=%s serviceInstanceNum=%d Currently running %d pods is more than expected %d, So deleting %d pods on nodeLabel %s", flow, serviceInstanceNum, numOfExistingPods, nodeLabelStrategy.Replicas, numOfPodsToBeDeleted, nodeLabelStrategy.NodeLabel)
+						DeleteExtraPods(nameSpace, ExistingPodsList, numOfPodsToBeDeleted)
+					}
+				}
+
+			} else {
+				result = false
+				glog.Infof("flow=%s serviceInstanceNum=%d GetNumOfExistingPods failed. Ignoring Custom scheduling for nodeLabel=%s", flow, serviceInstanceNum, nodeLabelStrategy.NodeLabel)
+			}
+		}
+	} else {
+		result = false
+		glog.Infof("flow=%s serviceInstanceNum=%d Looks like Strategy declaration is wrong. Ignoring the custom scheduling. Pls fix and re-try", flow, serviceInstanceNum)
+	}
+	return nodeselectors, result
+}
+
+func DeleteExtraPods(nameSpace string, ExistingPodsList []string, numOfPodsToBeDeleted int) {
 	for i := 0; i < numOfPodsToBeDeleted; i++ {
 		podName := ExistingPodsList[i]
 		glog.Infof("Deleting the pod i %d Name %s", i, podName)
