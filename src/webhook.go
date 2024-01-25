@@ -306,7 +306,10 @@ func GetNodeLabel(nameSpace string, pod corev1.Pod, serviceInstanceNum int) (map
 
 	podTemplateHash, isRollout := pod.Labels["rollouts-pod-template-hash"]
 	if !isRollout {
-		podTemplateHash, _ = pod.Labels["pod-template-hash"]
+		podTemplateHash, isDeployment = pod.Labels["pod-template-hash"]
+		if !isDeployment {
+			return nodeselectors, result
+		}
 	}
 	podNameSplitList := strings.Split(pod.GenerateName, podTemplateHash)
 	fmt.Println("")
